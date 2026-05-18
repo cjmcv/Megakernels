@@ -22,6 +22,17 @@ __device__ __forceinline__ static void nanosleep() {
     asm volatile("{nanosleep.u32 %0;}" :: "r"(Config::SPIN_LOOP_SLEEP_NS));
 }
 
+// <NT> barrier 采用的就是最普通的全局内存访问
+// * acquire: 读获取，单向栅栏, 本指令之后的所有 ld/st，不能重排到本指令之前
+// * release: 写释放，只用于store，本指令之前的所有 ld/st，不能重排到本指令之后
+// acquire/release一般配对使用才构成完整内存序。
+//
+//  PTX后缀	        语义                    典型用途
+// .relaxed	  无顺序保证，弱一致           普通内存访问（默认值）
+// .acquire	  acquire 语义，后续访问可见   mutex、spinlock
+// .release	  release 语义，前置访问可见   mutex、spinlock
+// .ca	      cache all (L1+L2)           通常的全局加载
+// .cs	      ache streaming              大数据、只读一次
 template <typename Config>
 __device__ __forceinline__ void barrier_wait(int* barrier_addr, const int target) {
     int barrier_val;

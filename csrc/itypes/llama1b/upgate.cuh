@@ -1,4 +1,32 @@
 #pragma once
+//
+// <NT> RmsUpgateSilu: RMS Norm + UP MatVec + GATE MatVec + SiLU 融合算子
+//
+// 功能: hidden_states → RMS Norm → UP×silu(GATE) → downproj 输入
+//
+// 与其他算子的关键区别 (SiLU 两输入问题):
+//   SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+//   公式需要: up_output 和 gate_output 两个 matvec 结果
+//
+//   传统方案 (跨 block 依赖):
+//     kernel0  Block 0: matvec UP → 写 gmem[up_out]
+//              Block 1: matvec GATE → 写 gmem[gate_out] 
+//     kernel1  Block 0: 读 gmem[up_out] + 读 gmem[gate_out] → 计算 SiLU
+//     问题: Block 1 必须等 Block 0 完成才能读 up_out (跨 block 同步 + gmem 中转)
+//
+//   本实现方案 (无跨 block 依赖):
+//     每个 SM 交替执行 up/gate 两个 tile:
+//       iter 0 (up):   matvec UP → up_out (缓存到寄存器)
+//       iter 1 (gate): matvec GATE → gate_out → SiLU(gate) → up_out * SiLU(gate)
+//       iter 2 (up):   复用寄存器，继续处理下一个 up tile
+//     up_out 和 gate_out 在同一个 storer loop 内交替产生和使用，
+//     通过寄存器传递，无需 gmem 中转，无需跨 block 同步。
+//
+// 数据分块:
+//   UP/GATE 各有 INTERMEDIATE_DIM / BLOCK_SIZE = 512 / 16 = 32 blocks
+//   每个 SM 处理 ceil(32 / sm_count) 个 up+gate 对，共 iters = 2 * blocks_per_sm
+//   交错执行: iter 偶数=up, iter 奇数=gate
+//
 
 #include "kittens.cuh"
 #include "schema.cuh"
@@ -15,9 +43,14 @@ struct RmsUpgateSilu {
             layer_idx    = instruction.indices[0];
             sm_idx       = instruction.indices[1];
             sm_count     = instruction.indices[2];
+            // <NT> 每个 SM 处理 2 倍的 blocks: up 和 gate 交错执行
+            //      例如 sm_count=4, total_blocks=32:
+            //        SM 0: block 0,4,8,... (up) 和 block 0,4,8,... (gate) 交替
+            //      iters = up_blocks + gate_blocks = 2 * blocks_per_sm
             total_blocks = instruction.indices[3];
             iters        = 2 * ((total_blocks - sm_idx + sm_count - 1) / sm_count);
         }
+        // <NT> block_at: 计算第 i 个迭代对应的 block 索引 (偶数 iter=up, 奇数 iter=gate 共用同一 block)
         __device__ inline parsed_instruction(state_t<Config> &s)
             : parsed_instruction(s.instruction()) {}
         __device__ inline int block_at(int i) const {
