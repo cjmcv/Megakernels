@@ -35,6 +35,10 @@ struct RmsLmHead {
                                      {block_idx, col_idx}, sem);
         }
 
+        // <NT> 算子                       store 逻辑                                   说明
+        //    rms_lm_head	        matvec_reduce → warp::store → tma::store	reduce 后直接写 gmem
+        //    rms_qkv_rope_append	matvec_reduce → RoPE → tma::store	        需要额外 apply RoPE
+        //    upgate                   不用 store！                              storer 内联了 up/gate 交替逻辑
         __device__ static inline void store(state_t<Config> &s, const Globals &g, parsed_instruction &inst,
               int output_idx, int output_stage) {
             int block_idx = inst.start_block_idx + output_idx;
@@ -48,6 +52,7 @@ struct RmsLmHead {
             kittens::warp::store(logits_smem, logits_rv);
             kittens::warp::sync();
             if (kittens::warp::elect_leader()) {
+                // <NT> 多了写回gmem的操作
                 kittens::tma::store_async<kittens::cache_policy::EVICT_LAST>(g.template gls<DST>(), logits_smem, {0, block_idx});
                 kittens::tma::store_async_read_wait();
             }
